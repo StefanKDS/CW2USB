@@ -1,161 +1,124 @@
 /*
-  CW2USBKB - funktionale Neuimplementierung fuer Pro Micro
-  mit ATmega32U4.
+  MorsePaddle - USB HID keyboard adapter for an ATmega32U4 Pro Micro.
 
-  Inspiriert durch:
-  barryshaffer/cw2usbkb, Autor KK7JXG
+  Functional reimplementation inspired by:
+  barryshaffer/cw2usbkb, author KK7JXG.
 
-  Anschluss:
-    Paddle-Kontakt 1 -> Pin 2
-    Paddle-Kontakt 2 -> Pin 3
-    Gemeinsamer Anschluss -> GND
+  Wiring:
+    Paddle contact 1 -> pin 2
+    Paddle contact 2 -> pin 3
+    Common contact  -> GND
 
-  Standard:
-    Pin 2 -> Plus
-    Pin 3 -> u-Umlaut
+  Default output:
+    Pin 2 -> "+"
+    Pin 3 -> "u with diaeresis" (U+00FC)
 
-  Fuer diese Zeichen muss das empfangende Geraet
-  die externe Tastatur als Deutsch / QWERTZ behandeln.
+  The receiving device must use a German keyboard layout
+  for these physical HID keys to produce the intended characters.
+
+  Keyboard keys remain pressed until their contacts are released.
+  Both contacts operate independently.
+
+  Configuration is stored in Configuration.h.
 */
 
+#include <Arduino.h>
 #include <Keyboard.h>
 
 #if !defined(__AVR_ATmega32U4__)
-#error "Dieser Sketch ist fuer einen Pro Micro mit ATmega32U4 vorgesehen."
+#error "This sketch requires a Pro Micro with an ATmega32U4."
 #endif
 
-// ======================================================
-// Einstellungen
-// ======================================================
+#include <avr/io.h>
 
-constexpr uint8_t PADDLE1_PIN = 2;
-constexpr uint8_t PADDLE2_PIN = 3;
+#include "Configuration.h"
+#include "Contact.h"
 
-// false: sofort den unten eingestellten Standardmodus nutzen.
-// true: Modus nach dem Einschalten per Paddle auswaehlen.
-constexpr bool MODUSAUSWAHL_BEIM_START = true;
+Contact contact1(Config::PADDLE_1_PIN, Config::DEBOUNCE_MS);
+Contact contact2(Config::PADDLE_2_PIN, Config::DEBOUNCE_MS);
 
-// RX-LED beim klassischen Pro Micro:
-// Pin 17, aktiv bei LOW.
-// Bei einem abweichenden Nachbau bei Bedarf deaktivieren.
-constexpr bool STATUS_LED_NUTZEN = true;
-constexpr uint8_t STATUS_LED_PIN = 17;
+Config::OperatingMode currentMode = Config::DEFAULT_MODE;
 
-// Entprellzeit pro Kontakt.
-constexpr unsigned long ENTPRELLZEIT_MS = 5;
+uint8_t activeKey1 = 0;
+uint8_t activeKey2 = 0;
 
-// Grenze zwischen kurzer und langer Modusauswahl.
-constexpr unsigned long LANGER_DRUCK_MS = 250;
+bool key1Sent = false;
+bool key2Sent = false;
 
-// Arduino Keyboard verwendet fuer direkte HID-Tastencodes
-// einen Offset von 136.
-//
-// HID 0x30: rechte eckige Klammer auf US-Tastatur,
-//           Plus auf deutscher Tastatur.
-//
-// HID 0x2F: linke eckige Klammer auf US-Tastatur,
-//           u-Umlaut auf deutscher Tastatur.
-constexpr uint8_t MANIA_TASTE_1 = 136 + 0x30;
-constexpr uint8_t MANIA_TASTE_2 = 136 + 0x2F;
+// Explicit declarations also keep the sketch independent of
+// Arduino IDE automatic function-prototype generation.
+void setStatusLed(bool on);
+void updateContacts();
+void waitForRelease();
+void selectOperatingMode();
+void assignKeys();
+void confirmOperatingMode();
+void updateKey(bool contactPressed, uint8_t key, bool &alreadySent);
 
-// Fuer die Belegung aus dem tatsaechlichen Originalcode
-// stattdessen die beiden Zeilen oben ersetzen durch:
-//
-// constexpr uint8_t MANIA_TASTE_1 = 'a';
-// constexpr uint8_t MANIA_TASTE_2 = 'b';
-
-enum Betriebsmodus : uint8_t {
-  HANDTASTE_MANIA = 1,
-  PADDLE_MANIA    = 2,
-  HANDTASTE_VBAND = 3,
-  PADDLE_VBAND    = 4
-};
-
-// Wird verwendet, wenn die Startauswahl deaktiviert ist.
-constexpr uint8_t STANDARDMODUS = PADDLE_MANIA;
-
-// ======================================================
-// Entprellter Eingang
-// ======================================================
-
-class Kontakt {
-public:
-  explicit Kontakt(uint8_t pin)
-    : pin_(pin),
-      rohGedrueckt_(false),
-      stabilGedrueckt_(false),
-      letzteAenderung_(0) {
+void setup() {
+  // Classic Pro Micro TX LED: PD5.
+  // Make PD5 an input so USB activity cannot drive the LED LOW.
+  // This affects sketch execution only, not the bootloader.
+  if (Config::DISABLE_TX_LED) {
+    DDRD &= ~_BV(DDD5);
+    PORTD |= _BV(PORTD5);
   }
 
-  void begin() {
-    pinMode(pin_, INPUT_PULLUP);
-
-    rohGedrueckt_ = (digitalRead(pin_) == LOW);
-    stabilGedrueckt_ = rohGedrueckt_;
-    letzteAenderung_ = millis();
+  if (Config::USE_STATUS_LED) {
+    digitalWrite(Config::STATUS_LED_PIN, HIGH);
+    pinMode(Config::STATUS_LED_PIN, OUTPUT);
   }
 
-  void update() {
-    const unsigned long jetzt = millis();
-    const bool neuerRohzustand = (digitalRead(pin_) == LOW);
+  contact1.begin();
+  contact2.begin();
 
-    if (neuerRohzustand != rohGedrueckt_) {
-      rohGedrueckt_ = neuerRohzustand;
-      letzteAenderung_ = jetzt;
-    }
+  Keyboard.begin();
 
-    if (jetzt - letzteAenderung_ >= ENTPRELLZEIT_MS) {
-      stabilGedrueckt_ = rohGedrueckt_;
-    }
+  // Do not wait for a serial connection: this also runs on a phone.
+  delay(1000);
+  Keyboard.releaseAll();
+
+  if (Config::SELECT_MODE_AT_STARTUP) {
+    selectOperatingMode();
   }
 
-  bool gedrueckt() const {
-    return stabilGedrueckt_;
-  }
+  assignKeys();
+  confirmOperatingMode();
 
-private:
-  const uint8_t pin_;
-  bool rohGedrueckt_;
-  bool stabilGedrueckt_;
-  unsigned long letzteAenderung_;
-};
+  // A contact held during startup must not generate a key press.
+  waitForRelease();
+  setStatusLed(false);
+}
 
-Kontakt kontakt1(PADDLE1_PIN);
-Kontakt kontakt2(PADDLE2_PIN);
+void loop() {
+  updateContacts();
 
-uint8_t aktuellerModus = STANDARDMODUS;
+  updateKey(contact1.isPressed(), activeKey1, key1Sent);
+  updateKey(contact2.isPressed(), activeKey2, key2Sent);
 
-uint8_t aktiveTaste1 = 0;
-uint8_t aktiveTaste2 = 0;
+  setStatusLed(key1Sent || key2Sent);
+}
 
-bool taste1Gesendet = false;
-bool taste2Gesendet = false;
-
-// ======================================================
-// Hilfsfunktionen
-// ======================================================
-
-void statusLed(bool an) {
-  if (STATUS_LED_NUTZEN) {
-    digitalWrite(STATUS_LED_PIN, an ? LOW : HIGH);
+void setStatusLed(bool on) {
+  if (Config::USE_STATUS_LED) {
+    digitalWrite(Config::STATUS_LED_PIN, on ? LOW : HIGH);
   }
 }
 
-void kontakteAktualisieren() {
-  kontakt1.update();
-  kontakt2.update();
+void updateContacts() {
+  contact1.update();
+  contact2.update();
 }
 
-void warteAufFreigabe() {
-  // Erst fortfahren, wenn beide Kontakte sowohl
-  // elektrisch als auch entprellt geoeffnet sind.
+void waitForRelease() {
+  // Require both the electrical and debounced states to be released.
   while (true) {
-    kontakteAktualisieren();
+    updateContacts();
 
-    if (digitalRead(PADDLE1_PIN) == HIGH &&
-        digitalRead(PADDLE2_PIN) == HIGH &&
-        !kontakt1.gedrueckt() &&
-        !kontakt2.gedrueckt()) {
+    if (digitalRead(Config::PADDLE_1_PIN) == HIGH &&
+        digitalRead(Config::PADDLE_2_PIN) == HIGH &&
+        !contact1.isPressed() &&
+        !contact2.isPressed()) {
       return;
     }
 
@@ -163,42 +126,44 @@ void warteAufFreigabe() {
   }
 }
 
-void modusAuswaehlen() {
-  warteAufFreigabe();
+void selectOperatingMode() {
+  waitForRelease();
 
-  uint8_t ausgewaehlterKontakt = 0;
-  unsigned long druckBeginn = 0;
+  uint8_t selectedContact = 0;
+  unsigned long pressStartMs = 0;
 
   while (true) {
-    kontakteAktualisieren();
+    updateContacts();
 
-    // Blinkende LED: Auswahl ist aktiv.
-    statusLed(((millis() / 250UL) & 1UL) != 0);
+    // Blink while waiting for a mode selection.
+    setStatusLed(((millis() / 250UL) & 1UL) != 0);
 
-    if (ausgewaehlterKontakt == 0) {
-      if (kontakt1.gedrueckt()) {
-        ausgewaehlterKontakt = 1;
-        druckBeginn = millis();
-      } else if (kontakt2.gedrueckt()) {
-        ausgewaehlterKontakt = 2;
-        druckBeginn = millis();
+    if (selectedContact == 0) {
+      if (contact1.isPressed()) {
+        selectedContact = 1;
+        pressStartMs = millis();
+      } else if (contact2.isPressed()) {
+        selectedContact = 2;
+        pressStartMs = millis();
       }
     } else {
-      const bool nochGedrueckt =
-        (ausgewaehlterKontakt == 1)
-          ? kontakt1.gedrueckt()
-          : kontakt2.gedrueckt();
+      const bool stillPressed =
+        (selectedContact == 1)
+          ? contact1.isPressed()
+          : contact2.isPressed();
 
-      if (!nochGedrueckt) {
-        const bool langerDruck =
-          (millis() - druckBeginn >= LANGER_DRUCK_MS);
+      if (!stillPressed) {
+        const bool longPress =
+          (millis() - pressStartMs >= Config::LONG_PRESS_MS);
 
-        if (ausgewaehlterKontakt == 1) {
-          aktuellerModus =
-            langerDruck ? HANDTASTE_VBAND : HANDTASTE_MANIA;
+        if (selectedContact == 1) {
+          currentMode = longPress
+            ? Config::STRAIGHT_KEY_VBAND
+            : Config::STRAIGHT_KEY_MANIA;
         } else {
-          aktuellerModus =
-            langerDruck ? PADDLE_VBAND : PADDLE_MANIA;
+          currentMode = longPress
+            ? Config::PADDLE_VBAND
+            : Config::PADDLE_MANIA;
         }
 
         break;
@@ -208,127 +173,71 @@ void modusAuswaehlen() {
     delay(1);
   }
 
-  statusLed(false);
-  warteAufFreigabe();
+  setStatusLed(false);
+  waitForRelease();
 }
 
-void tastenFestlegen() {
-  aktiveTaste1 = 0;
-  aktiveTaste2 = 0;
+void assignKeys() {
+  activeKey1 = 0;
+  activeKey2 = 0;
 
-  switch (aktuellerModus) {
-    case HANDTASTE_MANIA:
-      aktiveTaste1 = ' ';
+  switch (currentMode) {
+    case Config::STRAIGHT_KEY_MANIA:
+      activeKey1 = ' ';
       break;
 
-    case PADDLE_MANIA:
-      aktiveTaste1 = MANIA_TASTE_1;
-      aktiveTaste2 = MANIA_TASTE_2;
+    case Config::PADDLE_MANIA:
+      activeKey1 = Config::MANIA_KEY_1;
+      activeKey2 = Config::MANIA_KEY_2;
       break;
 
-    case HANDTASTE_VBAND:
-      aktiveTaste1 = KEY_LEFT_CTRL;
+    case Config::STRAIGHT_KEY_VBAND:
+      activeKey1 = KEY_LEFT_CTRL;
       break;
 
-    case PADDLE_VBAND:
-      aktiveTaste1 = KEY_LEFT_CTRL;
-      aktiveTaste2 = KEY_RIGHT_CTRL;
+    case Config::PADDLE_VBAND:
+      activeKey1 = KEY_LEFT_CTRL;
+      activeKey2 = KEY_RIGHT_CTRL;
       break;
   }
 }
 
-void modusBestaetigen() {
-  // Anzahl kurzer LED-Blinksignale:
-  // 1 = Handtaste Mania
-  // 2 = Paddle Mania
-  // 3 = Handtaste VBand
-  // 4 = Paddle VBand
-  if (!STATUS_LED_NUTZEN) {
+void confirmOperatingMode() {
+  // Number of short LED flashes:
+  // 1 = straight key, Morse Mania
+  // 2 = paddle, Morse Mania
+  // 3 = straight key, VBand
+  // 4 = paddle, VBand
+  if (!Config::USE_STATUS_LED) {
     return;
   }
 
   delay(200);
 
-  for (uint8_t i = 0; i < aktuellerModus; ++i) {
-    statusLed(true);
+  for (uint8_t i = 0; i < static_cast<uint8_t>(currentMode); ++i) {
+    setStatusLed(true);
     delay(100);
-    statusLed(false);
+    setStatusLed(false);
     delay(150);
   }
 }
 
-void tasteAktualisieren(
-  bool kontaktGedrueckt,
-  uint8_t taste,
-  bool &bereitsGesendet
+void updateKey(
+  bool contactPressed,
+  uint8_t key,
+  bool &alreadySent
 ) {
-  // Taste 0 bedeutet: Eingang in diesem Modus unbenutzt.
-  if (taste == 0) {
+  // A zero key means this contact is unused in the current mode.
+  if (key == 0 || contactPressed == alreadySent) {
     return;
   }
 
-  if (kontaktGedrueckt == bereitsGesendet) {
-    return;
-  }
-
-  if (kontaktGedrueckt) {
-    Keyboard.press(taste);
+  if (contactPressed) {
+    Keyboard.press(key);
   } else {
-    Keyboard.release(taste);
+    Keyboard.release(key);
   }
 
-  bereitsGesendet = kontaktGedrueckt;
+  alreadySent = contactPressed;
 }
 
-// ======================================================
-// Arduino
-// ======================================================
-
-void setup() {
-  if (STATUS_LED_NUTZEN) {
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    pinMode(STATUS_LED_PIN, OUTPUT);
-  }
-
-  kontakt1.begin();
-  kontakt2.begin();
-
-  Keyboard.begin();
-
-  // Kurze Startpause, ohne auf eine serielle Verbindung
-  // zu warten. Dadurch auch fuer den Handy-Betrieb geeignet.
-  delay(1000);
-
-  Keyboard.releaseAll();
-
-  if (MODUSAUSWAHL_BEIM_START) {
-    modusAuswaehlen();
-  }
-
-  tastenFestlegen();
-  modusBestaetigen();
-
-  // Ein beim Start gehaltener Kontakt soll keine
-  // unbeabsichtigte Tastatureingabe ausloesen.
-  warteAufFreigabe();
-
-  statusLed(false);
-}
-
-void loop() {
-  kontakteAktualisieren();
-
-  tasteAktualisieren(
-    kontakt1.gedrueckt(),
-    aktiveTaste1,
-    taste1Gesendet
-  );
-
-  tasteAktualisieren(
-    kontakt2.gedrueckt(),
-    aktiveTaste2,
-    taste2Gesendet
-  );
-
-  statusLed(taste1Gesendet || taste2Gesendet);
-}
